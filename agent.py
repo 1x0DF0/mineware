@@ -41,7 +41,6 @@ from trees import (
     detect_trees,
     format_dets,
     load_yolo,
-    pick_best_tree,
 )
 
 pydirectinput.FAILSAFE = False
@@ -54,19 +53,26 @@ ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "minecraft_yolo" / "run1" / "weights" / "best.pt"
 
 # Perception — low YOLO conf; CV fallback fills in when model is silent
-CONF_THRESHOLD = 0.20
+CONF_THRESHOLD = 0.25
 USE_CV_FALLBACK = True
+# While chopping, ignore CV (it invents many small distant "trees" and thrashs FSM)
+CV_FALLBACK_WHILE_CHOPPING = False
+MIN_ACTION_CONF = 0.35         # ignore ultra-weak YOLO boxes for control
 
 # Approach / distance (bbox height / frame height)
-CLOSE_ENOUGH_FRAC = 0.42       # box taller than this → CHOPPING
-LOST_TREE_GRACE = 4            # consecutive frames without a tree before SEARCHING
+# Log showed h_frac~0.8 on huge off-center foliage → instant CHOPPING into air.
+# Require BOTH size and centering before swinging.
+CLOSE_ENOUGH_FRAC = 0.38
+CENTER_CHOP_FRAC = 0.12        # |cx - mid| / width must be ≤ this to start/keep chop
+LOST_TREE_GRACE = 5            # consecutive frames without a tree before SEARCHING
+STICKY_MAX_JUMP_FRAC = 0.22    # reject new pick farther than this from last_cx (fraction of W)
 
 # Camera / movement
 SEARCH_LOOK_DX = 45            # px per SEARCHING tick (slow scan right)
-CENTER_DEADZONE_FRAC = 0.08    # |offset|/width below this → "centered"
-CENTER_LOOK_GAIN = 0.35        # look_dx = gain * pixel_offset (clamped)
-CENTER_LOOK_MAX = 80           # max |look| px per tick while centering
-APPROACH_BURST_S = 0.25        # short forward bursts
+CENTER_DEADZONE_FRAC = 0.08    # |offset|/width below this → "centered" for look
+CENTER_LOOK_GAIN = 0.40        # look_dx = gain * pixel_offset (clamped)
+CENTER_LOOK_MAX = 100          # max |look| px per tick while centering
+APPROACH_BURST_S = 0.28        # short forward bursts
 APPROACH_LOOK_DY = 0           # keep pitch level while approaching (tune if needed)
 
 # Chopping
@@ -144,6 +150,80 @@ def center_look_dx(tree: Detection, frame_w: int) -> int:
     return dx
 
 
+def is_centered(tree: Detection, frame_w: int, frac: float = CENTER_CHOP_FRAC) -> bool:
+    return abs(tree.cx - frame_w * 0.5) <= frac * frame_w
+
+
+def pick_control_tree(
+    dets: list,
+    frame_w: int,
+    frame_h: int,
+    last: Optional[Detection],
+    prefer_yolo: bool,
+) -> Optional[Detection]:
+    """
+    Sticky target selection for the FSM.
+
+    Prefer: YOLO over CV when available, near last_cx (don't hop forests),
+    reasonable conf, not a random edge blob.
+    """
+    trees = [d for d in dets if d.cls_name and "tree" in d.cls_name.lower()]
+    if not trees:
+        return None
+
+    if prefer_yolo:
+        yolo = [d for d in trees if d.source == "yolo" and d.conf >= MIN_ACTION_CONF]
+        if yolo:
+            trees = yolo
+        else:
+            # weak YOLO only — still allow but filter conf
+            yolo_any = [d for d in trees if d.source == "yolo"]
+            if yolo_any:
+                trees = [d for d in yolo_any if d.conf >= CONF_THRESHOLD]
+    else:
+        trees = [d for d in trees if d.conf >= CONF_THRESHOLD or d.source == "cv"]
+
+    if not trees:
+        return None
+
+    mid = frame_w * 0.5
+
+    def score(d: Detection) -> float:
+        # higher is better
+        s = float(d.conf)
+        if d.source == "yolo":
+            s += 0.25
+        # soft preference for nearer-center when acquiring
+        s -= 0.9 * (abs(d.cx - mid) / max(frame_w, 1))
+        # stickiness: heavily prefer continuity with last lock
+        if last is not None:
+            jump = abs(d.cx - last.cx) / max(frame_w, 1)
+            s -= 2.5 * jump
+            # mild vertical continuity
+            s -= 0.5 * (abs(d.cy - last.cy) / max(frame_h, 1))
+        # reject absurd full-frame wallpaper boxes slightly by penalizing width
+        s -= 0.3 * (d.width / max(frame_w, 1))
+        return s
+
+    best = max(trees, key=score)
+
+    # Hard sticky gate: if we have a lock, don't accept a jump across the screen
+    if last is not None:
+        jump = abs(best.cx - last.cx) / max(frame_w, 1)
+        if jump > STICKY_MAX_JUMP_FRAC:
+            # try nearest to last instead of highest score far away
+            near = [
+                d for d in trees
+                if abs(d.cx - last.cx) / max(frame_w, 1) <= STICKY_MAX_JUMP_FRAC
+            ]
+            if near:
+                best = max(near, key=score)
+            else:
+                # keep last geometry as ghost (caller may treat as brief dropout)
+                return None
+    return best
+
+
 # =====================================================================
 # State machine
 # =====================================================================
@@ -173,10 +253,10 @@ def transition(ctx: AgentContext, new_state: State, reason: str) -> None:
 
 def step_searching(ctx: AgentContext, tree: Optional[Detection]) -> str:
     if tree is not None:
-        transition(ctx, State.APPROACHING, f"tree {tree.cls_name}:{tree.conf:.2f}")
+        transition(ctx, State.APPROACHING, f"tree {tree.cls_name}:{tree.conf:.2f}/{tree.source}")
         ctx.last_tree = tree
         ctx.lost_frames = 0
-        return f"action=lock_on conf={tree.conf:.2f}"
+        return f"action=lock_on conf={tree.conf:.2f} src={tree.source}"
     safe_look(SEARCH_LOOK_DX, 0)
     return f"action=look(+{SEARCH_LOOK_DX},0) scan"
 
@@ -192,27 +272,39 @@ def step_approaching(
         if ctx.lost_frames >= LOST_TREE_GRACE:
             transition(ctx, State.SEARCHING, f"lost tree for {ctx.lost_frames} frames")
             return "action=abort_approach"
-        # keep creeping forward on brief dropouts using last box
-        safe_forward(APPROACH_BURST_S * 0.5)
-        return f"action=forward(brief) lost={ctx.lost_frames}/{LOST_TREE_GRACE}"
+        # hold position — don't walk blind toward a lost lock
+        return f"action=wait_lock lost={ctx.lost_frames}/{LOST_TREE_GRACE}"
 
     ctx.lost_frames = 0
     ctx.last_tree = tree
     h_frac = tree.height_frac(frame_h)
+    off = (tree.cx - frame_w * 0.5) / max(frame_w, 1)
 
-    if h_frac >= CLOSE_ENOUGH_FRAC:
-        transition(ctx, State.CHOPPING, f"close enough h_frac={h_frac:.2f}")
-        return f"action=begin_chop h_frac={h_frac:.2f}"
-
+    # 1) Always center first if outside chop deadzone
     dx = center_look_dx(tree, frame_w)
-    if dx != 0:
-        safe_look(dx, APPROACH_LOOK_DY)
-        # if badly off-center, re-aim before walking
-        if abs(tree.cx - frame_w * 0.5) > 0.18 * frame_w:
-            return f"action=center dx={dx} h_frac={h_frac:.2f}"
+    if not is_centered(tree, frame_w, CENTER_CHOP_FRAC):
+        if dx != 0:
+            safe_look(dx, APPROACH_LOOK_DY)
+        return (
+            f"action=center dx={dx} off={off:+.2f} h_frac={h_frac:.2f} "
+            f"src={tree.source}"
+        )
 
+    # 2) Centered + big enough → chop
+    if h_frac >= CLOSE_ENOUGH_FRAC and is_centered(tree, frame_w, CENTER_CHOP_FRAC):
+        transition(
+            ctx,
+            State.CHOPPING,
+            f"close+centered h_frac={h_frac:.2f} off={off:+.2f}",
+        )
+        return f"action=begin_chop h_frac={h_frac:.2f} off={off:+.2f}"
+
+    # 3) Centered but far → walk in
     safe_forward(APPROACH_BURST_S)
-    return f"action=forward({APPROACH_BURST_S}s) dx={dx} h_frac={h_frac:.2f}"
+    return (
+        f"action=forward({APPROACH_BURST_S}s) h_frac={h_frac:.2f} "
+        f"off={off:+.2f} src={tree.source}"
+    )
 
 
 def step_chopping(
@@ -238,27 +330,39 @@ def step_chopping(
         if ctx.lost_frames >= LOST_TREE_GRACE:
             transition(ctx, State.SEARCHING, "lost tree while chopping")
             return "action=abort_chop"
-        # keep swinging at last aim
+        # keep swinging at last aim (do not re-pick random forest blobs)
         safe_chop(CHOP_HOLD_S)
         return f"action=chop(blind) attempt={ctx.chop_attempts}/{MAX_CHOP_ATTEMPTS}"
 
     ctx.lost_frames = 0
     ctx.last_tree = tree
     h_frac = tree.height_frac(frame_h)
+    off = (tree.cx - frame_w * 0.5) / max(frame_w, 1)
 
-    # If we somehow drifted far away again, re-approach
-    if h_frac < CLOSE_ENOUGH_FRAC * 0.55:
-        transition(ctx, State.APPROACHING, f"drifted away h_frac={h_frac:.2f}")
+    # Only re-approach if *this sticky target* got small AND we are still
+    # roughly on it. Do not chase a different far blob (old bug from CV).
+    if h_frac < CLOSE_ENOUGH_FRAC * 0.45 and is_centered(tree, frame_w, CENTER_CHOP_FRAC * 1.5):
+        transition(ctx, State.APPROACHING, f"target shrunk h_frac={h_frac:.2f}")
         return f"action=reapproach h_frac={h_frac:.2f}"
 
-    # Micro-center then swing
-    dx = center_look_dx(tree, frame_w)
-    if dx != 0:
-        # softer gain while chopping
-        soft = max(-CHOP_AIM_LOOK_MAX, min(CHOP_AIM_LOOK_MAX, int(dx * CHOP_AIM_LOOK_GAIN / max(CENTER_LOOK_GAIN, 1e-3))))
-        if soft == 0:
-            soft = 1 if dx > 0 else -1
-        safe_look(soft, 0)
+    # If lock jumped off-center a lot, re-center before swinging again
+    if not is_centered(tree, frame_w, CENTER_CHOP_FRAC * 1.4):
+        dx = center_look_dx(tree, frame_w)
+        if dx != 0:
+            soft = max(
+                -CHOP_AIM_LOOK_MAX,
+                min(
+                    CHOP_AIM_LOOK_MAX,
+                    int(dx * CHOP_AIM_LOOK_GAIN / max(CENTER_LOOK_GAIN, 1e-3)),
+                ),
+            )
+            if soft == 0:
+                soft = 1 if dx > 0 else -1
+            safe_look(soft, 0)
+        return (
+            f"action=reaim dx off={off:+.2f} attempt={ctx.chop_attempts}/"
+            f"{MAX_CHOP_ATTEMPTS}"
+        )
 
     if ctx.chop_attempts > MAX_CHOP_ATTEMPTS:
         print(f"  ** chop timeout after {MAX_CHOP_ATTEMPTS} attempts — rescan")
@@ -268,7 +372,7 @@ def step_chopping(
     safe_chop(CHOP_HOLD_S)
     return (
         f"action=chop({CHOP_HOLD_S}s) attempt={ctx.chop_attempts}/{MAX_CHOP_ATTEMPTS} "
-        f"h_frac={h_frac:.2f} conf={tree.conf:.2f}"
+        f"h_frac={h_frac:.2f} off={off:+.2f} conf={tree.conf:.2f} src={tree.source}"
     )
 
 
@@ -356,10 +460,18 @@ def tick_once(
     # Black / frozen capture → useless
     if frame.mean() < 5:
         print(f"[{ctx.tick:04d}] WARN capture nearly black mean={frame.mean():.1f} region={region}")
+
+    use_cv = USE_CV_FALLBACK
+    if ctx.state is State.CHOPPING and not CV_FALLBACK_WHILE_CHOPPING:
+        use_cv = False
+
     dets = detect_trees(
-        frame, model=model, conf=conf, use_cv_fallback=USE_CV_FALLBACK
+        frame, model=model, conf=conf, use_cv_fallback=use_cv
     )
-    tree = pick_best_tree(dets, w)
+    prefer_yolo = ctx.state in (State.APPROACHING, State.CHOPPING)
+    tree = pick_control_tree(
+        dets, w, h, last=ctx.last_tree, prefer_yolo=prefer_yolo
+    )
 
     # Optional HUD (non-fatal if it fails — menus, darkness, etc.)
     hud = None
@@ -376,7 +488,7 @@ def tick_once(
         # keep a coarse state label for logs
         if tree is None:
             ctx.state = State.SEARCHING
-        elif tree.height_frac(h) >= CLOSE_ENOUGH_FRAC:
+        elif tree.height_frac(h) >= CLOSE_ENOUGH_FRAC and is_centered(tree, w):
             ctx.state = State.CHOPPING
         else:
             ctx.state = State.APPROACHING
@@ -389,12 +501,14 @@ def tick_once(
     else:
         action = "action=idle"
 
-    tree_str = (
-        f"tree={tree.cls_name}:{tree.conf:.2f} "
-        f"cx={tree.cx:.0f}/{w} h_frac={tree.height_frac(h):.2f}"
-        if tree is not None
-        else "tree=None"
-    )
+    if tree is not None:
+        off = (tree.cx - w * 0.5) / max(w, 1)
+        tree_str = (
+            f"tree={tree.cls_name}:{tree.conf:.2f}[{tree.source}] "
+            f"cx={tree.cx:.0f}/{w} off={off:+.2f} h_frac={tree.height_frac(h):.2f}"
+        )
+    else:
+        tree_str = "tree=None"
     print(
         f"[{ctx.tick:04d}] {ctx.state.name:12s} | dets={format_dets(dets)} | "
         f"{tree_str} | {action}{hud_str}"
