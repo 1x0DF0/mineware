@@ -65,20 +65,24 @@ py .\agent.py --bc --chops 1
 
 Writes `policy/bc_mlp.pt` + `policy/bc_meta.json` (includes mine hold table).
 
-If weights are missing:
+If weights are missing / weak (agent chops air on huge foliage boxes):
 
 ```powershell
+# A) Public tree datasets (recommended when bootstrap YOLO is trash)
+#    free key: https://app.roboflow.com/settings/api
+$env:ROBOFLOW_API_KEY="your_key"
+py .\fetch_public_dataset.py
+py .\train_yolo.py --epochs 50
+
+# B) Local auto-label (weaker)
 py .\setup_dataset.py --local-only
 py .\train_yolo.py --epochs 50
 ```
 
-Or with a free [Roboflow API key](https://app.roboflow.com/settings/api):
-
-```powershell
-$env:ROBOFLOW_API_KEY="your_key"
-py .\setup_dataset.py --roboflow-only
-py .\train_yolo.py --epochs 50
-```
+Public sources worth trying:
+- https://universe.roboflow.com/minecraft-thing/minecraft-tree-detection
+- https://universe.roboflow.com/ananthv/minecraft-tree-wood-identification-dataset
+- Roboflow blog: game automation / Minecraft trunks
 
 ## Notes
 

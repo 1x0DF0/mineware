@@ -53,35 +53,41 @@ ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "minecraft_yolo" / "run1" / "weights" / "best.pt"
 
 # Perception — low YOLO conf; CV fallback fills in when model is silent
-CONF_THRESHOLD = 0.25
+CONF_THRESHOLD = 0.28
 USE_CV_FALLBACK = True
 # While chopping, ignore CV (it invents many small distant "trees" and thrashs FSM)
 CV_FALLBACK_WHILE_CHOPPING = False
-MIN_ACTION_CONF = 0.35         # ignore ultra-weak YOLO boxes for control
+MIN_ACTION_CONF = 0.40         # ignore ultra-weak YOLO boxes for lock/control
+MIN_CHOP_CONF = 0.45           # never start chopping on garbage conf (log: 0.32→fake success)
 
-# Approach / distance (bbox height / frame height)
-# Log showed h_frac~0.8 on huge off-center foliage → instant CHOPPING into air.
-# Require BOTH size and centering before swinging.
-CLOSE_ENOUGH_FRAC = 0.38
-CENTER_CHOP_FRAC = 0.12        # |cx - mid| / width must be ≤ this to start/keep chop
-LOST_TREE_GRACE = 5            # consecutive frames without a tree before SEARCHING
-STICKY_MAX_JUMP_FRAC = 0.22    # reject new pick farther than this from last_cx (fraction of W)
+# Approach / distance
+# Bootstrap YOLO often returns h_frac≈0.8 on a big foliage blob even when far —
+# so "h_frac large ⇒ close" is false. We force a minimum walk-in and reject
+# wallpaper-wide / ultra-tall weak boxes as "not a trunk in reach".
+CLOSE_ENOUGH_FRAC = 0.30       # min height frac once near
+CLOSE_MAX_FRAC = 0.70          # above this + weak conf = unreliable blob
+MAX_CHOP_BOX_W_FRAC = 0.48     # box wider than this ⇒ canopy wall, keep walking/centering
+CENTER_CHOP_FRAC = 0.10        # |cx - mid| / width to start/keep chop
+MIN_APPROACH_FORWARDS = 6      # always walk at least this many bursts after lock
+LOST_TREE_GRACE = 5
+STICKY_MAX_JUMP_FRAC = 0.22
 
 # Camera / movement
-SEARCH_LOOK_DX = 45            # px per SEARCHING tick (slow scan right)
-CENTER_DEADZONE_FRAC = 0.08    # |offset|/width below this → "centered" for look
-CENTER_LOOK_GAIN = 0.40        # look_dx = gain * pixel_offset (clamped)
-CENTER_LOOK_MAX = 100          # max |look| px per tick while centering
-APPROACH_BURST_S = 0.28        # short forward bursts
-APPROACH_LOOK_DY = 0           # keep pitch level while approaching (tune if needed)
+SEARCH_LOOK_DX = 50
+CENTER_DEADZONE_FRAC = 0.07
+CENTER_LOOK_GAIN = 0.45
+CENTER_LOOK_MAX = 120          # larger looks so we actually turn on 1440p/ultrawide
+APPROACH_BURST_S = 0.35        # longer bursts so motion is visible
+APPROACH_LOOK_DY = 8           # slight look-down toward trunks
+CHOP_LOOK_DY = 12
 
 # Chopping
-CHOP_HOLD_S = 0.55             # each mine_or_attack hold duration (overridden by BC hold table)
-MAX_CHOP_ATTEMPTS = 25         # timeout per tree
-CHOP_AIM_LOOK_GAIN = 0.25      # micro-adjust aim while chopping
-CHOP_AIM_LOOK_MAX = 40
-BC_LOOK_MAG = 45               # look pixels when policy says look_left/right
-BC_FORWARD_S = 0.20            # forward burst when policy says forward
+CHOP_HOLD_S = 0.70
+MAX_CHOP_ATTEMPTS = 30
+CHOP_AIM_LOOK_GAIN = 0.35
+CHOP_AIM_LOOK_MAX = 55
+BC_LOOK_MAG = 50
+BC_FORWARD_S = 0.25
 
 # Loop
 TARGET_FPS = 6                 # decision rate cap
@@ -152,6 +158,44 @@ def center_look_dx(tree: Detection, frame_w: int) -> int:
 
 def is_centered(tree: Detection, frame_w: int, frac: float = CENTER_CHOP_FRAC) -> bool:
     return abs(tree.cx - frame_w * 0.5) <= frac * frame_w
+
+
+def box_w_frac(tree: Detection, frame_w: int) -> float:
+    return tree.width / max(frame_w, 1)
+
+
+def is_plausible_reach_box(tree: Detection, frame_w: int, frame_h: int) -> bool:
+    """Reject wallpaper foliage the bootstrap model loves."""
+    h_frac = tree.height_frac(frame_h)
+    w_frac = box_w_frac(tree, frame_w)
+    if w_frac > MAX_CHOP_BOX_W_FRAC:
+        return False
+    if h_frac > CLOSE_MAX_FRAC and tree.conf < 0.60:
+        return False
+    if tree.conf < MIN_CHOP_CONF and tree.source == "yolo":
+        return False
+    return True
+
+
+def can_begin_chop(
+    ctx: "AgentContext",
+    tree: Detection,
+    frame_w: int,
+    frame_h: int,
+) -> Tuple[bool, str]:
+    h_frac = tree.height_frac(frame_h)
+    w_frac = box_w_frac(tree, frame_w)
+    off = (tree.cx - frame_w * 0.5) / max(frame_w, 1)
+
+    if ctx.approach_forwards < MIN_APPROACH_FORWARDS:
+        return False, f"need_walk {ctx.approach_forwards}/{MIN_APPROACH_FORWARDS}"
+    if not is_centered(tree, frame_w, CENTER_CHOP_FRAC):
+        return False, f"not_centered off={off:+.2f}"
+    if not is_plausible_reach_box(tree, frame_w, frame_h):
+        return False, f"bad_box h={h_frac:.2f} w={w_frac:.2f} conf={tree.conf:.2f}"
+    if h_frac < CLOSE_ENOUGH_FRAC:
+        return False, f"too_far h={h_frac:.2f}"
+    return True, f"ok h={h_frac:.2f} w={w_frac:.2f} walks={ctx.approach_forwards}"
 
 
 def pick_control_tree(
@@ -235,6 +279,7 @@ class AgentContext:
     max_chops: int = DEFAULT_MAX_CHOPS
     lost_frames: int = 0
     chop_attempts: int = 0
+    approach_forwards: int = 0  # forced walk-in counter after lock
     last_tree: Optional[Detection] = None
     tick: int = 0
 
@@ -249,14 +294,23 @@ def transition(ctx: AgentContext, new_state: State, reason: str) -> None:
     if new_state is State.SEARCHING:
         ctx.lost_frames = 0
         ctx.last_tree = None
+        ctx.approach_forwards = 0
+    if new_state is State.APPROACHING and ctx.approach_forwards < 0:
+        ctx.approach_forwards = 0
 
 
-def step_searching(ctx: AgentContext, tree: Optional[Detection]) -> str:
-    if tree is not None:
+def step_searching(ctx: AgentContext, tree: Optional[Detection], frame_w: int = 0) -> str:
+    if tree is not None and tree.conf >= MIN_ACTION_CONF:
         transition(ctx, State.APPROACHING, f"tree {tree.cls_name}:{tree.conf:.2f}/{tree.source}")
         ctx.last_tree = tree
         ctx.lost_frames = 0
+        ctx.approach_forwards = 0
         return f"action=lock_on conf={tree.conf:.2f} src={tree.source}"
+    if tree is not None and frame_w > 0:
+        dx = center_look_dx(tree, frame_w)
+        if dx != 0 and abs(tree.cx - frame_w * 0.5) > 0.15 * frame_w:
+            safe_look(dx, 0)
+            return f"action=scan_toward conf={tree.conf:.2f} dx={dx}"
     safe_look(SEARCH_LOOK_DX, 0)
     return f"action=look(+{SEARCH_LOOK_DX},0) scan"
 
@@ -272,38 +326,41 @@ def step_approaching(
         if ctx.lost_frames >= LOST_TREE_GRACE:
             transition(ctx, State.SEARCHING, f"lost tree for {ctx.lost_frames} frames")
             return "action=abort_approach"
-        # hold position — don't walk blind toward a lost lock
-        return f"action=wait_lock lost={ctx.lost_frames}/{LOST_TREE_GRACE}"
+        # keep creeping so we don't freeze when sticky drops a frame
+        safe_forward(APPROACH_BURST_S * 0.6)
+        ctx.approach_forwards += 1
+        return f"action=forward(brief) lost={ctx.lost_frames}/{LOST_TREE_GRACE} walks={ctx.approach_forwards}"
 
     ctx.lost_frames = 0
     ctx.last_tree = tree
     h_frac = tree.height_frac(frame_h)
+    w_frac = box_w_frac(tree, frame_w)
     off = (tree.cx - frame_w * 0.5) / max(frame_w, 1)
 
-    # 1) Always center first if outside chop deadzone
-    dx = center_look_dx(tree, frame_w)
+    # 1) Center first
     if not is_centered(tree, frame_w, CENTER_CHOP_FRAC):
+        dx = center_look_dx(tree, frame_w)
         if dx != 0:
             safe_look(dx, APPROACH_LOOK_DY)
         return (
             f"action=center dx={dx} off={off:+.2f} h_frac={h_frac:.2f} "
-            f"src={tree.source}"
+            f"w_frac={w_frac:.2f} walks={ctx.approach_forwards} src={tree.source}"
         )
 
-    # 2) Centered + big enough → chop
-    if h_frac >= CLOSE_ENOUGH_FRAC and is_centered(tree, frame_w, CENTER_CHOP_FRAC):
-        transition(
-            ctx,
-            State.CHOPPING,
-            f"close+centered h_frac={h_frac:.2f} off={off:+.2f}",
-        )
-        return f"action=begin_chop h_frac={h_frac:.2f} off={off:+.2f}"
+    # 2) Gate chop: must have walked enough + plausible box + size
+    ok, why = can_begin_chop(ctx, tree, frame_w, frame_h)
+    if ok:
+        transition(ctx, State.CHOPPING, f"begin_chop {why}")
+        return f"action=begin_chop {why}"
 
-    # 3) Centered but far → walk in
+    # 3) Otherwise walk in (always progress approach_forwards when centered)
+    safe_look(0, APPROACH_LOOK_DY)  # mild pitch toward trunk
     safe_forward(APPROACH_BURST_S)
+    ctx.approach_forwards += 1
     return (
-        f"action=forward({APPROACH_BURST_S}s) h_frac={h_frac:.2f} "
-        f"off={off:+.2f} src={tree.source}"
+        f"action=forward({APPROACH_BURST_S}s) h_frac={h_frac:.2f} w_frac={w_frac:.2f} "
+        f"off={off:+.2f} walks={ctx.approach_forwards}/{MIN_APPROACH_FORWARDS} "
+        f"why={why} src={tree.source}"
     )
 
 
@@ -316,11 +373,13 @@ def step_chopping(
     ctx.chop_attempts += 1
 
     if tree is None:
-        # Tree gone from view — treat as success if we were actively chopping
-        if ctx.chop_attempts >= 3:
+        # Only count success if we actually approached then swung several times
+        if ctx.chop_attempts >= 5 and ctx.approach_forwards >= MIN_APPROACH_FORWARDS:
             ctx.chops_done += 1
-            print(f"  ** chop success? tree vanished after {ctx.chop_attempts} swings "
-                  f"(chops_done={ctx.chops_done}/{ctx.max_chops})")
+            print(
+                f"  ** chop success? tree vanished after {ctx.chop_attempts} swings "
+                f"walks={ctx.approach_forwards} (chops_done={ctx.chops_done}/{ctx.max_chops})"
+            )
             if ctx.chops_done >= ctx.max_chops:
                 transition(ctx, State.DONE, "target chop count reached")
             else:
@@ -330,23 +389,21 @@ def step_chopping(
         if ctx.lost_frames >= LOST_TREE_GRACE:
             transition(ctx, State.SEARCHING, "lost tree while chopping")
             return "action=abort_chop"
-        # keep swinging at last aim (do not re-pick random forest blobs)
         safe_chop(CHOP_HOLD_S)
         return f"action=chop(blind) attempt={ctx.chop_attempts}/{MAX_CHOP_ATTEMPTS}"
 
     ctx.lost_frames = 0
     ctx.last_tree = tree
     h_frac = tree.height_frac(frame_h)
+    w_frac = box_w_frac(tree, frame_w)
     off = (tree.cx - frame_w * 0.5) / max(frame_w, 1)
 
-    # Only re-approach if *this sticky target* got small AND we are still
-    # roughly on it. Do not chase a different far blob (old bug from CV).
-    if h_frac < CLOSE_ENOUGH_FRAC * 0.45 and is_centered(tree, frame_w, CENTER_CHOP_FRAC * 1.5):
-        transition(ctx, State.APPROACHING, f"target shrunk h_frac={h_frac:.2f}")
+    # Target too small / still not in reach → walk more (don't thrash on CV)
+    if h_frac < CLOSE_ENOUGH_FRAC * 0.7 or ctx.approach_forwards < MIN_APPROACH_FORWARDS:
+        transition(ctx, State.APPROACHING, f"not in reach h={h_frac:.2f} walks={ctx.approach_forwards}")
         return f"action=reapproach h_frac={h_frac:.2f}"
 
-    # If lock jumped off-center a lot, re-center before swinging again
-    if not is_centered(tree, frame_w, CENTER_CHOP_FRAC * 1.4):
+    if not is_centered(tree, frame_w, CENTER_CHOP_FRAC * 1.3):
         dx = center_look_dx(tree, frame_w)
         if dx != 0:
             soft = max(
@@ -358,9 +415,9 @@ def step_chopping(
             )
             if soft == 0:
                 soft = 1 if dx > 0 else -1
-            safe_look(soft, 0)
+            safe_look(soft, CHOP_LOOK_DY)
         return (
-            f"action=reaim dx off={off:+.2f} attempt={ctx.chop_attempts}/"
+            f"action=reaim off={off:+.2f} attempt={ctx.chop_attempts}/"
             f"{MAX_CHOP_ATTEMPTS}"
         )
 
@@ -369,10 +426,12 @@ def step_chopping(
         transition(ctx, State.SEARCHING, "chop timeout")
         return "action=timeout_rescan"
 
+    safe_look(0, CHOP_LOOK_DY)
     safe_chop(CHOP_HOLD_S)
     return (
         f"action=chop({CHOP_HOLD_S}s) attempt={ctx.chop_attempts}/{MAX_CHOP_ATTEMPTS} "
-        f"h_frac={h_frac:.2f} off={off:+.2f} conf={tree.conf:.2f} src={tree.source}"
+        f"h_frac={h_frac:.2f} w_frac={w_frac:.2f} off={off:+.2f} "
+        f"conf={tree.conf:.2f} src={tree.source}"
     )
 
 
@@ -493,7 +552,7 @@ def tick_once(
         else:
             ctx.state = State.APPROACHING
     elif ctx.state is State.SEARCHING:
-        action = step_searching(ctx, tree)
+        action = step_searching(ctx, tree, frame_w=w)
     elif ctx.state is State.APPROACHING:
         action = step_approaching(ctx, tree, w, h)
     elif ctx.state is State.CHOPPING:
