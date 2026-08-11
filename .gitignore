@@ -15,6 +15,9 @@ test_capture.png
 *_debug*.png
 pred_*.png
 
+# Human play sessions (large). Keep code; ignore recorded data.
+sessions/
+
 # Training data (rebuild with setup_dataset.py)
 minecraft_dataset/
 runs/

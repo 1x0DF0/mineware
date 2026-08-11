@@ -3,6 +3,7 @@ opencv-python
 mss
 pygetwindow
 pydirectinput
+pynput
 ultralytics
 torch
 # optional: Roboflow public dataset download

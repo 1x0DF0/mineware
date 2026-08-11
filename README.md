@@ -30,14 +30,28 @@ Minecraft must be **in-world** (cursor locked), not in a menu.
 
 ```powershell
 # Optional: verify detections
-py .\detect_live.py --conf 0.35
+py .\detect_live.py --conf 0.2
 
 # Chop one tree
-py .\agent.py --conf 0.35
+py .\agent.py --conf 0.2
 
 # More trees
 py .\agent.py --chops 3
 ```
+
+## Record your play (imitation data)
+
+```powershell
+py -m pip install pynput
+py .\record_session.py --fps 10
+# play normally — chop trees with fist, then pickaxe, etc.
+# Ctrl+C to stop
+
+py .\mine_stats.py --session sessions\<id>
+```
+
+Each session writes `sessions/<timestamp>/meta.jsonl` (+ optional `frames/`).
+Every tick logs HUD, tree detections, keys, mouse deltas, and LMB hold duration.
 
 If weights are missing:
 
