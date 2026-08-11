@@ -1,0 +1,9 @@
+numpy
+opencv-python
+mss
+pygetwindow
+pydirectinput
+ultralytics
+torch
+# optional: Roboflow public dataset download
+roboflow

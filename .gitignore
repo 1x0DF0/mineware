@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Captures / debug dumps
+images/
+dataset_raw/
+_hud_debug/
+frame_*.png
+test_capture.png
+*_debug*.png
+pred_*.png
+
+# Training data (rebuild with setup_dataset.py)
+minecraft_dataset/
+runs/
+
+# YOLO base weights (auto-downloaded by ultralytics)
+yolov8*.pt
+yolo11*.pt
+
+# Keep trained run weights optional — last.pt is large/redundant
+minecraft_yolo/**/weights/last.pt
+minecraft_yolo/**/weights/epoch*.pt
+minecraft_yolo/**/*.png
+minecraft_yolo/**/*.jpg
+minecraft_yolo/**/results.csv
+minecraft_yolo/**/args.yaml
+minecraft_yolo/**/*.csv
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
