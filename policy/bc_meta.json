@@ -24,15 +24,15 @@
     "look_right": 0.5
   },
   "hold_table": {
-    "default_hold_s": 0.25,
+    "default_hold_s": 1.71,
     "by_slot_s": {
-      "-1": 0.25,
-      "0": 0.25,
-      "2": 0.25,
+      "-1": 1.187,
+      "2": 2.5,
       "5": 1.71
     },
-    "n_holds": 7,
-    "max_hold_ms_filter": 4000
+    "n_holds": 3,
+    "min_hold_ms_filter": 200,
+    "max_hold_ms_filter": 8000
   },
   "val_metrics": {
     "forward": {
