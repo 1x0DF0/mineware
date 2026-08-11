@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from policy import BCPolicy  # canonical definition — do not redefine here
 from policy_data import (
     ACTION_NAMES,
     FEATURE_DIM,
@@ -34,21 +35,6 @@ from policy_data import (
 
 ROOT = Path(__file__).resolve().parent
 OUT_DIR = ROOT / "policy"
-
-
-class BCPolicy(nn.Module):
-    def __init__(self, in_dim: int = FEATURE_DIM, n_actions: int = len(ACTION_NAMES), hidden: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, n_actions),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)  # logits
 
 
 def pos_weight(Y: np.ndarray) -> torch.Tensor:

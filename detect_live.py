@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 
 import cv2
-from ultralytics import YOLO
 
 from main import (
     IMAGES_DIR,
@@ -28,7 +27,7 @@ from main import (
     focus_minecraft,
     get_region,
 )
-from trees import detect_trees, draw_detections, format_dets
+from trees import detect_trees, draw_detections, format_dets, load_yolo
 
 MODEL_PATH = Path(__file__).resolve().parent / "minecraft_yolo" / "run1" / "weights" / "best.pt"
 DEFAULT_CONF = 0.20
@@ -43,11 +42,10 @@ def main() -> None:
     args = ap.parse_args()
 
     enable_dpi_awareness()
-    if not args.model.is_file():
-        raise SystemExit(f"Missing weights: {args.model}\nRun train_yolo.py first.")
-
-    model = YOLO(str(args.model))
-    print(f"Model classes: {model.names}")
+    try:
+        model = load_yolo(args.model)
+    except FileNotFoundError as e:
+        raise SystemExit(str(e)) from e
     print(f"conf={args.conf} cv_fallback={not args.no_cv}")
 
     win = focus_minecraft()

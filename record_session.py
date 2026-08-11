@@ -38,7 +38,7 @@ from main import (
     get_region,
 )
 from hud import parse_hud
-from trees import detect_trees, pick_best_tree
+from trees import detect_trees, load_yolo, pick_best_tree
 
 ROOT = Path(__file__).resolve().parent
 SESSIONS_DIR = ROOT / "sessions"
@@ -343,13 +343,11 @@ def main(argv=None) -> int:
 
     model = None
     if not args.no_yolo:
-        if MODEL_PATH.is_file():
-            from ultralytics import YOLO
-
-            print(f"[init] Loading YOLO {MODEL_PATH}")
-            model = YOLO(str(MODEL_PATH))
-        else:
+        try:
+            model = load_yolo(MODEL_PATH)
+        except FileNotFoundError:
             print(f"[init] No weights at {MODEL_PATH} — CV-only detections")
+            model = None
 
     print(f"[init] Click into Minecraft — recording in {args.countdown:.0f}s")
     time.sleep(args.countdown)

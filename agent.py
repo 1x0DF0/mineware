@@ -25,7 +25,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import pydirectinput
-from ultralytics import YOLO
 
 from main import (
     capture_frame,
@@ -41,6 +40,7 @@ from trees import (
     Detection,
     detect_trees,
     format_dets,
+    load_yolo,
     pick_best_tree,
 )
 
@@ -98,21 +98,6 @@ class State(Enum):
 # =====================================================================
 # Perception helpers
 # =====================================================================
-
-def load_model(path: Path) -> YOLO:
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"YOLO weights not found: {path}\n"
-            f"Train first (train_yolo.py) or pass --model <path>"
-        )
-    print(f"[init] Loading YOLO model from {path} ...")
-    model = YOLO(str(path))
-    names = model.names if isinstance(model.names, dict) else {
-        i: n for i, n in enumerate(model.names)
-    }
-    print(f"[init] Classes: {names}")
-    return model
-
 
 # =====================================================================
 # Action helpers (safe release + thin wrappers)
@@ -360,7 +345,7 @@ def step_bc(ctx: AgentContext, tree, hud, frame_w: int, frame_h: int, bc) -> str
 
 def tick_once(
     ctx: AgentContext,
-    model: YOLO,
+    model,
     region: dict,
     conf: float,
     bc=None,
@@ -441,7 +426,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     period = 1.0 / max(args.fps, 0.5)
 
     enable_dpi_awareness()
-    model = load_model(args.model)
+    model = load_yolo(args.model)
 
     bc = None
     if args.bc:

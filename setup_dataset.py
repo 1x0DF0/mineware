@@ -115,6 +115,9 @@ def _normalize_yaml(yaml_path: Path) -> None:
 
 
 # ---------- Classical auto-label (Minecraft trees) ----------
+# NOTE: Parallel leaf/wood heuristics also live in trees.detect_trees_cv
+# (live perception fallback). If you retune HSV/NMS here, consider updating
+# trees.py the same way (and vice versa). Not shared yet on purpose.
 
 def _wood_mask(bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)

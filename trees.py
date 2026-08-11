@@ -64,6 +64,9 @@ def is_tree_class(name: str) -> bool:
 
 
 # ---------- classical CV ----------
+# NOTE: Parallel leaf/wood heuristics also live in setup_dataset.auto_label_trees
+# (offline bootstrap labeling). If you retune HSV/NMS here, consider updating
+# setup_dataset.py the same way (and vice versa). Not shared yet on purpose.
 
 def _wood_mask(bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -204,6 +207,34 @@ def _nms(dets: List[Detection], iou_thresh: float) -> List[Detection]:
 
 
 # ---------- YOLO ----------
+
+def load_yolo(path) -> "YOLO":
+    """
+    Single shared YOLO loader for agent / detect_live / record_session.
+    Raises FileNotFoundError if weights are missing.
+    """
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"YOLO weights not found: {p}\n"
+            f"Train first (setup_dataset.py + train_yolo.py) or pass a valid --model path."
+        )
+    try:
+        from ultralytics import YOLO as _YOLO
+    except ImportError as e:
+        raise ImportError(
+            "ultralytics is required for YOLO inference. "
+            "Install: py -m pip install ultralytics"
+        ) from e
+    model = _YOLO(str(p))
+    names = model.names if isinstance(model.names, dict) else {
+        i: n for i, n in enumerate(model.names)
+    }
+    print(f"[yolo] loaded {p}  classes={names}")
+    return model
+
 
 def detect_trees_yolo(
     model,
