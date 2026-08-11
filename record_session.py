@@ -2,36 +2,34 @@
 Record human Minecraft play for imitation learning.
 
 Each tick (~ --fps Hz) writes:
-  - frames/NNNNNN.png          (optional)
+  - frames/NNNNNN.jpg|png   (optional)
   - meta.jsonl line with:
       t, frame, hud, detections, keys, mouse, mine hold state
 
-Keyboard/mouse are captured via pynput while YOU play (not via pydirectinput).
+Input is polled via Win32 GetAsyncKeyState (works with Minecraft raw input).
+pynput is not required on Windows.
 
-Usage (Windows, Minecraft in-world):
-    py record_session.py
-    py record_session.py --fps 10 --conf 0.2
-    py record_session.py --no-frames          # actions+hud only (small)
+Usage:
+    py record_session.py --fps 10 --jpeg 85
+    py record_session.py --no-frames
     py record_session.py --max-minutes 30
 
-Stop with Ctrl+C. Then:
+Ctrl+C to stop. Then:
     py mine_stats.py --session sessions/<id>
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import sys
-import threading
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
-import numpy as np
 
 from main import (
     capture_frame,
@@ -46,23 +44,204 @@ ROOT = Path(__file__).resolve().parent
 SESSIONS_DIR = ROOT / "sessions"
 MODEL_PATH = ROOT / "minecraft_yolo" / "run1" / "weights" / "best.pt"
 
-# Keys we care about for a movement/mine policy
-TRACKED_KEYS = {
-    "w", "a", "s", "d",
-    "space", "shift", "ctrl",
-    "e", "q", "f", "r",
-    "1", "2", "3", "4", "5", "6", "7", "8", "9",
-    "esc", "tab",
+# Virtual-key codes (Win32)
+VK = {
+    "w": 0x57,
+    "a": 0x41,
+    "s": 0x53,
+    "d": 0x44,
+    "space": 0x20,
+    "shift": 0x10,  # either shift
+    "ctrl": 0x11,
+    "e": 0x45,
+    "q": 0x51,
+    "f": 0x46,
+    "r": 0x52,
+    "1": 0x31,
+    "2": 0x32,
+    "3": 0x33,
+    "4": 0x34,
+    "5": 0x35,
+    "6": 0x36,
+    "7": 0x37,
+    "8": 0x38,
+    "9": 0x39,
+    "esc": 0x1B,
+    "tab": 0x09,
 }
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
+VK_MBUTTON = 0x04
+
+TRACKED_KEYS = list(VK.keys())
 
 
-def _norm_key(key) -> Optional[str]:
-    """Map pynput key object → stable string, or None if ignored."""
+# ---------- Win32 input poller ----------
+
+class WinInputPoller:
+    """
+    Poll key/mouse state each tick with GetAsyncKeyState.
+    Minecraft's raw input often never reaches pynput hooks; this does.
+    """
+
+    def __init__(self) -> None:
+        self.user32 = ctypes.windll.user32
+        self._lmb_prev = False
+        self._lmb_down_t: Optional[float] = None
+        self._last_pos: Optional[Tuple[int, int]] = None
+        self.total_mines = 0
+
+    def _down(self, vk: int) -> bool:
+        # high bit set ⇒ currently down
+        return bool(self.user32.GetAsyncKeyState(vk) & 0x8000)
+
+    def _cursor(self) -> Tuple[int, int]:
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        pt = POINT()
+        self.user32.GetCursorPos(ctypes.byref(pt))
+        return int(pt.x), int(pt.y)
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.perf_counter()
+        keys = {name: self._down(code) for name, code in VK.items()}
+        keys_down = sorted(k for k, v in keys.items() if v)
+
+        lmb = self._down(VK_LBUTTON)
+        rmb = self._down(VK_RBUTTON)
+        mmb = self._down(VK_MBUTTON)
+
+        completed: List[Dict[str, Any]] = []
+        if lmb and not self._lmb_prev:
+            self._lmb_down_t = now
+        elif not lmb and self._lmb_prev and self._lmb_down_t is not None:
+            hold_ms = int((now - self._lmb_down_t) * 1000)
+            completed.append({"hold_ms": hold_ms, "ended_t": time.time()})
+            self.total_mines += 1
+            self._lmb_down_t = None
+        self._lmb_prev = lmb
+
+        hold_ms_so_far = 0
+        if lmb and self._lmb_down_t is not None:
+            hold_ms_so_far = int((now - self._lmb_down_t) * 1000)
+
+        x, y = self._cursor()
+        dx = dy = 0
+        if self._last_pos is not None:
+            dx = x - self._last_pos[0]
+            dy = y - self._last_pos[1]
+        self._last_pos = (x, y)
+
+        return {
+            "keys": keys,
+            "keys_down": keys_down,
+            "mouse": {
+                "lmb": lmb,
+                "rmb": rmb,
+                "mmb": mmb,
+                "dx": dx,
+                "dy": dy,
+                "x": x,
+                "y": y,
+            },
+            "mine": {
+                "lmb_held": lmb,
+                "hold_ms_so_far": hold_ms_so_far,
+                "completed": completed,
+            },
+        }
+
+
+class FallbackPynputPoller:
+    """Non-Windows fallback using pynput listeners."""
+
+    def __init__(self) -> None:
+        from pynput import keyboard, mouse
+
+        self.keys_down: set = set()
+        self.lmb = self.rmb = self.mmb = False
+        self.dx = self.dy = 0
+        self._last = None
+        self._lmb_down_t = None
+        self._lmb_prev = False
+        self.total_mines = 0
+        self._completed: List[Dict[str, Any]] = []
+
+        def on_press(key):
+            name = _norm_key_pynput(key)
+            if name:
+                self.keys_down.add(name)
+
+        def on_release(key):
+            name = _norm_key_pynput(key)
+            if name:
+                self.keys_down.discard(name)
+
+        def on_click(x, y, button, pressed):
+            btn = str(button).lower()
+            if "left" in btn:
+                self.lmb = pressed
+            elif "right" in btn:
+                self.rmb = pressed
+            elif "middle" in btn:
+                self.mmb = pressed
+
+        def on_move(x, y):
+            if self._last is not None:
+                self.dx += int(x - self._last[0])
+                self.dy += int(y - self._last[1])
+            self._last = (x, y)
+
+        self._kb = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self._ms = mouse.Listener(on_click=on_click, on_move=on_move)
+        self._kb.start()
+        self._ms.start()
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.perf_counter()
+        lmb = self.lmb
+        completed: List[Dict[str, Any]] = []
+        if lmb and not self._lmb_prev:
+            self._lmb_down_t = now
+        elif not lmb and self._lmb_prev and self._lmb_down_t is not None:
+            hold_ms = int((now - self._lmb_down_t) * 1000)
+            completed.append({"hold_ms": hold_ms, "ended_t": time.time()})
+            self.total_mines += 1
+            self._lmb_down_t = None
+        self._lmb_prev = lmb
+        hold_ms_so_far = (
+            int((now - self._lmb_down_t) * 1000)
+            if lmb and self._lmb_down_t is not None
+            else 0
+        )
+        dx, dy = self.dx, self.dy
+        self.dx = self.dy = 0
+        keys = {k: (k in self.keys_down) for k in TRACKED_KEYS}
+        return {
+            "keys": keys,
+            "keys_down": sorted(self.keys_down),
+            "mouse": {"lmb": lmb, "rmb": self.rmb, "mmb": self.mmb, "dx": dx, "dy": dy},
+            "mine": {
+                "lmb_held": lmb,
+                "hold_ms_so_far": hold_ms_so_far,
+                "completed": completed,
+            },
+        }
+
+    def stop(self) -> None:
+        try:
+            self._kb.stop()
+            self._ms.stop()
+        except Exception:
+            pass
+
+
+def _norm_key_pynput(key) -> Optional[str]:
     try:
         from pynput.keyboard import Key
     except ImportError:
         return None
-
     if hasattr(key, "char") and key.char:
         c = key.char.lower()
         return c if c in TRACKED_KEYS else None
@@ -78,127 +257,18 @@ def _norm_key(key) -> Optional[str]:
         Key.tab: "tab",
     }
     name = mapping.get(key)
-    if name and name in TRACKED_KEYS:
-        return name
-    return None
+    return name if name in TRACKED_KEYS else None
 
 
-@dataclass
-class InputState:
-    """Thread-safe snapshot of keyboard / mouse since last tick."""
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    keys_down: Set[str] = field(default_factory=set)
-    lmb: bool = False
-    rmb: bool = False
-    mmb: bool = False
-    # mouse absolute last sample + accumulated relative delta this tick
-    last_x: Optional[int] = None
-    last_y: Optional[int] = None
-    dx: int = 0
-    dy: int = 0
-    # mine timing
-    lmb_down_t: Optional[float] = None
-    # completed holds waiting to be flushed into the next meta line
-    completed_mines: List[Dict[str, Any]] = field(default_factory=list)
-
-    def on_key_down(self, name: str) -> None:
-        with self.lock:
-            self.keys_down.add(name)
-
-    def on_key_up(self, name: str) -> None:
-        with self.lock:
-            self.keys_down.discard(name)
-
-    def on_click(self, button_name: str, pressed: bool) -> None:
-        with self.lock:
-            now = time.perf_counter()
-            if button_name == "lmb":
-                if pressed:
-                    self.lmb = True
-                    if self.lmb_down_t is None:
-                        self.lmb_down_t = now
-                else:
-                    self.lmb = False
-                    if self.lmb_down_t is not None:
-                        hold_ms = int((now - self.lmb_down_t) * 1000)
-                        self.completed_mines.append(
-                            {"hold_ms": hold_ms, "ended_t": time.time()}
-                        )
-                        self.lmb_down_t = None
-            elif button_name == "rmb":
-                self.rmb = pressed
-            elif button_name == "mmb":
-                self.mmb = pressed
-
-    def on_move(self, x: int, y: int) -> None:
-        with self.lock:
-            if self.last_x is not None and self.last_y is not None:
-                self.dx += int(x - self.last_x)
-                self.dy += int(y - self.last_y)
-            self.last_x = int(x)
-            self.last_y = int(y)
-
-    def snapshot_and_reset_deltas(self) -> Dict[str, Any]:
-        with self.lock:
-            now = time.perf_counter()
-            hold_ms = 0
-            if self.lmb and self.lmb_down_t is not None:
-                hold_ms = int((now - self.lmb_down_t) * 1000)
-            mines = list(self.completed_mines)
-            self.completed_mines.clear()
-            dx, dy = self.dx, self.dy
-            self.dx = 0
-            self.dy = 0
-            keys = sorted(self.keys_down)
-            return {
-                "keys": {k: (k in self.keys_down) for k in TRACKED_KEYS},
-                "keys_down": keys,
-                "mouse": {
-                    "lmb": self.lmb,
-                    "rmb": self.rmb,
-                    "mmb": self.mmb,
-                    "dx": dx,
-                    "dy": dy,
-                },
-                "mine": {
-                    "lmb_held": self.lmb,
-                    "hold_ms_so_far": hold_ms,
-                    "completed": mines,  # holds that ended this tick
-                },
-            }
+def make_poller():
+    if sys.platform == "win32":
+        print("[init] input: Win32 GetAsyncKeyState poller (game-safe)")
+        return WinInputPoller()
+    print("[init] input: pynput fallback")
+    return FallbackPynputPoller()
 
 
-def start_listeners(state: InputState):
-    from pynput import keyboard, mouse
-
-    def on_press(key):
-        name = _norm_key(key)
-        if name and name in TRACKED_KEYS:
-            state.on_key_down(name)
-
-    def on_release(key):
-        name = _norm_key(key)
-        if name and name in TRACKED_KEYS:
-            state.on_key_up(name)
-
-    def on_click(x, y, button, pressed):
-        btn = str(button).lower()
-        if "left" in btn:
-            state.on_click("lmb", pressed)
-        elif "right" in btn:
-            state.on_click("rmb", pressed)
-        elif "middle" in btn:
-            state.on_click("mmb", pressed)
-
-    def on_move(x, y):
-        state.on_move(x, y)
-
-    kb = keyboard.Listener(on_press=on_press, on_release=on_release)
-    ms = mouse.Listener(on_click=on_click, on_move=on_move)
-    kb.start()
-    ms.start()
-    return kb, ms
-
+# ---------- helpers ----------
 
 def hud_to_dict(hud) -> Dict[str, Any]:
     if hud is None or not getattr(hud, "ok", False):
@@ -245,25 +315,26 @@ def new_session_dir() -> Path:
     return path
 
 
+# ---------- main ----------
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Record Minecraft play sessions")
-    ap.add_argument("--fps", type=float, default=10.0, help="record rate")
-    ap.add_argument("--conf", type=float, default=0.2, help="YOLO conf")
-    ap.add_argument("--no-frames", action="store_true", help="skip saving PNGs")
-    ap.add_argument("--no-yolo", action="store_true", help="skip detection (faster)")
-    ap.add_argument("--no-hud", action="store_true", help="skip HUD parse")
-    ap.add_argument("--no-cv", action="store_true", help="YOLO only, no CV fallback")
+    ap.add_argument("--fps", type=float, default=10.0)
+    ap.add_argument("--conf", type=float, default=0.2)
+    ap.add_argument("--no-frames", action="store_true")
+    ap.add_argument("--no-yolo", action="store_true")
+    ap.add_argument("--no-hud", action="store_true")
+    ap.add_argument("--no-cv", action="store_true")
     ap.add_argument("--full-window", action="store_true")
-    ap.add_argument("--max-minutes", type=float, default=0, help="0 = until Ctrl+C")
+    ap.add_argument("--max-minutes", type=float, default=0)
     ap.add_argument("--countdown", type=float, default=3.0)
-    ap.add_argument("--jpeg", type=int, default=0, help="if >0 save JPEG quality instead of PNG")
+    ap.add_argument(
+        "--jpeg",
+        type=int,
+        default=85,
+        help="JPEG quality 1-100 (default 85). Use 0 for PNG.",
+    )
     args = ap.parse_args(argv)
-
-    try:
-        import pynput  # noqa: F401
-    except ImportError:
-        print("Missing pynput. Install:  py -m pip install pynput")
-        return 1
 
     enable_dpi_awareness()
     session = new_session_dir()
@@ -274,6 +345,7 @@ def main(argv=None) -> int:
     if not args.no_yolo:
         if MODEL_PATH.is_file():
             from ultralytics import YOLO
+
             print(f"[init] Loading YOLO {MODEL_PATH}")
             model = YOLO(str(MODEL_PATH))
         else:
@@ -286,27 +358,33 @@ def main(argv=None) -> int:
     region = get_region(win, client_only=not args.full_window)
     print(f"[init] region={region}")
     print(f"[init] session → {session}")
-    print(f"[init] fps={args.fps} frames={not args.no_frames} yolo={model is not None}")
-    print("[init] Play normally. Ctrl+C to stop.")
+    print(
+        f"[init] fps={args.fps} frames={not args.no_frames} "
+        f"jpeg={args.jpeg} yolo={model is not None}"
+    )
+    print("[init] Play normally (WASD + look + hold LMB to mine). Ctrl+C to stop.")
 
-    state = InputState()
-    kb_listener, ms_listener = start_listeners(state)
-
+    poller = make_poller()
     period = 1.0 / max(args.fps, 0.5)
     t0 = time.time()
     deadline = t0 + args.max_minutes * 60.0 if args.max_minutes > 0 else None
     tick = 0
     bytes_frames = 0
+    ticks_with_keys = 0
 
     session_info = {
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "fps_target": args.fps,
         "region": region,
         "save_frames": not args.no_frames,
+        "jpeg": args.jpeg,
         "model": str(MODEL_PATH) if model else None,
         "conf": args.conf,
+        "input": "win32_poll" if sys.platform == "win32" else "pynput",
     }
-    (session / "session.json").write_text(json.dumps(session_info, indent=2), encoding="utf-8")
+    (session / "session.json").write_text(
+        json.dumps(session_info, indent=2), encoding="utf-8"
+    )
 
     try:
         with meta_path.open("a", encoding="utf-8") as meta_f:
@@ -316,29 +394,29 @@ def main(argv=None) -> int:
                     print("[done] max-minutes reached")
                     break
 
-                # refresh region occasionally without stealing focus
                 if tick % 50 == 0 and tick > 0:
                     try:
                         import pygetwindow as gw
+
                         wins = gw.getWindowsWithTitle("Minecraft")
                         if wins:
-                            region = get_region(wins[0], client_only=not args.full_window)
+                            region = get_region(
+                                wins[0], client_only=not args.full_window
+                            )
                     except Exception:
                         pass
 
                 wall_t = time.time()
                 frame = capture_frame(region)
                 h, w = frame.shape[:2]
+                inputs = poller.snapshot()
+                if inputs["keys_down"]:
+                    ticks_with_keys += 1
 
-                # inputs for this tick
-                inputs = state.snapshot_and_reset_deltas()
-
-                # perception
                 hud_dict: Dict[str, Any] = {"ok": False, "skipped": True}
                 if not args.no_hud:
                     try:
-                        hud = parse_hud(frame, return_crops=False)
-                        hud_dict = hud_to_dict(hud)
+                        hud_dict = hud_to_dict(parse_hud(frame, return_crops=False))
                     except Exception as e:
                         hud_dict = {"ok": False, "error": str(e)}
 
@@ -362,20 +440,25 @@ def main(argv=None) -> int:
                                 "cx": round(bt.cx, 1),
                                 "cy": round(bt.cy, 1),
                                 "h_frac": round(bt.height_frac(h), 3),
-                                "off_x_frac": round((bt.cx - w * 0.5) / max(w, 1), 3),
+                                "off_x_frac": round(
+                                    (bt.cx - w * 0.5) / max(w, 1), 3
+                                ),
                             }
                     except Exception as e:
-                        dets_list = []
                         best = {"error": str(e)}
 
                 frame_name = None
                 if not args.no_frames:
-                    frame_name = f"{tick:06d}"
-                    if args.jpeg > 0:
-                        fpath = frames_dir / f"{frame_name}.jpg"
-                        cv2.imwrite(str(fpath), frame, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg])
+                    stem = f"{tick:06d}"
+                    if args.jpeg and args.jpeg > 0:
+                        fpath = frames_dir / f"{stem}.jpg"
+                        cv2.imwrite(
+                            str(fpath),
+                            frame,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), int(args.jpeg)],
+                        )
                     else:
-                        fpath = frames_dir / f"{frame_name}.png"
+                        fpath = frames_dir / f"{stem}.png"
                         cv2.imwrite(str(fpath), frame)
                     try:
                         bytes_frames += fpath.stat().st_size
@@ -411,38 +494,48 @@ def main(argv=None) -> int:
                         if best and "conf" in best
                         else "none"
                     )
-                    n_done = len(inputs["mine"]["completed"])
                     print(
                         f"[{tick:05d}] t={wall_t - t0:6.1f}s keys={keys:12s} "
                         f"{held:3s} tree={tree:16s} "
-                        f"mine_done={n_done} disk~{bytes_frames / 1e6:.1f}MB"
+                        f"mines_total={poller.total_mines} "
+                        f"key_ticks={ticks_with_keys} "
+                        f"disk~{bytes_frames / 1e6:.1f}MB"
                     )
 
-                elapsed = time.perf_counter() - loop_t0
-                sleep_for = period - elapsed
+                sleep_for = period - (time.perf_counter() - loop_t0)
                 if sleep_for > 0:
                     time.sleep(sleep_for)
 
     except KeyboardInterrupt:
         print("\n[stop] Ctrl+C")
     finally:
-        try:
-            kb_listener.stop()
-            ms_listener.stop()
-        except Exception:
-            pass
+        if hasattr(poller, "stop"):
+            poller.stop()
 
-        # finalize session.json
         session_info["ended_utc"] = datetime.now(timezone.utc).isoformat()
         session_info["ticks"] = tick
         session_info["duration_s"] = round(time.time() - t0, 2)
         session_info["frames_bytes"] = bytes_frames
+        session_info["mines_total"] = getattr(poller, "total_mines", 0)
+        session_info["ticks_with_keys"] = ticks_with_keys
         (session / "session.json").write_text(
             json.dumps(session_info, indent=2), encoding="utf-8"
         )
-        print(f"[done] ticks={tick} duration={session_info['duration_s']}s")
+        print(
+            f"[done] ticks={tick} duration={session_info['duration_s']}s "
+            f"mines={session_info['mines_total']} key_ticks={ticks_with_keys}"
+        )
         print(f"[done] {meta_path}")
         print(f"[done] next:  py mine_stats.py --session {session}")
+
+        # quick integrity hint
+        if ticks_with_keys == 0 and tick > 20:
+            print(
+                "[warn] No keys recorded. Run a terminal *as Admin* if still empty, "
+                "or check you're not on a different keyboard layout."
+            )
+        if getattr(poller, "total_mines", 0) == 0 and tick > 20:
+            print("[warn] No completed LMB holds — fully release left mouse between chops.")
     return 0
 
 
