@@ -29,8 +29,17 @@ from main import (
 )
 from trees import detect_trees, draw_detections, format_dets, load_yolo
 
-MODEL_PATH = Path(__file__).resolve().parent / "minecraft_yolo" / "run1" / "weights" / "best.pt"
-DEFAULT_CONF = 0.20
+def _default_yolo_weights() -> Path:
+    root = Path(__file__).resolve().parent
+    for name in ("run2", "run1"):
+        p = root / "minecraft_yolo" / name / "weights" / "best.pt"
+        if p.is_file():
+            return p
+    return root / "minecraft_yolo" / "run1" / "weights" / "best.pt"
+
+
+MODEL_PATH = _default_yolo_weights()
+DEFAULT_CONF = 0.25
 
 
 def main() -> None:

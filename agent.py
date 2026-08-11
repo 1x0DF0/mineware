@@ -50,7 +50,16 @@ pydirectinput.FAILSAFE = False
 # =====================================================================
 
 ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "minecraft_yolo" / "run1" / "weights" / "best.pt"
+# Prefer newest training run if present
+def _default_yolo_weights() -> Path:
+    for name in ("run2", "run1"):
+        p = ROOT / "minecraft_yolo" / name / "weights" / "best.pt"
+        if p.is_file():
+            return p
+    return ROOT / "minecraft_yolo" / "run1" / "weights" / "best.pt"
+
+
+MODEL_PATH = _default_yolo_weights()
 
 # Perception — low YOLO conf; CV fallback fills in when model is silent
 CONF_THRESHOLD = 0.28
@@ -580,7 +589,12 @@ def tick_once(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Minecraft tree-chop agent")
-    p.add_argument("--model", type=Path, default=MODEL_PATH, help="path to YOLO best.pt")
+    p.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="path to YOLO best.pt (default: newest of run2/run1)",
+    )
     p.add_argument("--conf", type=float, default=CONF_THRESHOLD, help="YOLO confidence")
     p.add_argument("--chops", type=int, default=DEFAULT_MAX_CHOPS, help="successful chops then exit")
     p.add_argument("--fps", type=float, default=TARGET_FPS, help="decision rate cap")
@@ -599,7 +613,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     period = 1.0 / max(args.fps, 0.5)
 
     enable_dpi_awareness()
-    model = load_yolo(args.model)
+    yolo_path = args.model if args.model is not None else _default_yolo_weights()
+    model = load_yolo(yolo_path)
 
     bc = None
     if args.bc:

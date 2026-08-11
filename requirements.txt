@@ -6,5 +6,7 @@ pydirectinput
 pynput
 ultralytics
 torch
+# AMD GPU on Windows (not CUDA):
+#   py -m pip install torch-directml
 # optional: Roboflow public dataset download
 roboflow

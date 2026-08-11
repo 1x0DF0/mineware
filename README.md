@@ -17,6 +17,20 @@ Target: **Minecraft 26.2** (Java), Windows host.
 | `agent.py` | State machine: `SEARCHING` → `APPROACHING` → `CHOPPING` |
 | `bootstrap.ps1` | One-shot dataset + train on Windows |
 
+## Hardware notes
+
+This machine class (Ryzen 9 + **AMD** Radeon + big RAM):
+- **CUDA will not work** (NVIDIA only).
+- Train with **DirectML** (`torch-directml`) and/or **all CPU cores**.
+
+```powershell
+# scan PC
+powershell -ExecutionPolicy Bypass -File .\scan_hw.ps1
+
+# train using full power (AMD DML or maxed Ryzen)
+powershell -ExecutionPolicy Bypass -File .\train_powerhouse.ps1
+```
+
 ## Setup (Windows)
 
 ```powershell

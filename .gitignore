@@ -18,6 +18,10 @@ pred_*.png
 # Human play sessions (large). Keep code; ignore recorded data.
 sessions/
 
+# External downloads (regenerate via huggingface_hub / fetch_public_dataset)
+external_datasets/
+_rf_dl/
+
 # Policy checkpoints are small — keep them. Ignore only caches if any.
 policy/**/__pycache__/
 
