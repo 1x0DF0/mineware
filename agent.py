@@ -70,15 +70,18 @@ APPROACH_BURST_S = 0.25        # short forward bursts
 APPROACH_LOOK_DY = 0           # keep pitch level while approaching (tune if needed)
 
 # Chopping
-CHOP_HOLD_S = 0.55             # each mine_or_attack hold duration
+CHOP_HOLD_S = 0.55             # each mine_or_attack hold duration (overridden by BC hold table)
 MAX_CHOP_ATTEMPTS = 25         # timeout per tree
 CHOP_AIM_LOOK_GAIN = 0.25      # micro-adjust aim while chopping
 CHOP_AIM_LOOK_MAX = 40
+BC_LOOK_MAG = 45               # look pixels when policy says look_left/right
+BC_FORWARD_S = 0.20            # forward burst when policy says forward
 
 # Loop
 TARGET_FPS = 6                 # decision rate cap
 STARTUP_COUNTDOWN_S = 5
 DEFAULT_MAX_CHOPS = 1          # exit after this many successful chops
+POLICY_PATH = ROOT / "policy" / "bc_mlp.pt"
 
 
 # =====================================================================
@@ -284,11 +287,83 @@ def step_chopping(
     )
 
 
+def step_bc(ctx: AgentContext, tree, hud, frame_w: int, frame_h: int, bc) -> str:
+    """
+    Behavioral cloning tick: execute policy multi-label actions.
+    Still uses tree disappearance to count successful chops.
+    """
+    act = bc.predict_live(tree, hud, frame_w, frame_h)
+    parts = []
+
+    # look first so forward goes toward target
+    ldx = act.look_dx(BC_LOOK_MAG)
+    if ldx != 0:
+        safe_look(ldx, 0)
+        parts.append(f"look={ldx}")
+
+    if act.jump:
+        from main import jump
+        jump()
+        parts.append("jump")
+
+    if act.forward and not act.back:
+        safe_forward(BC_FORWARD_S)
+        parts.append(f"fwd({BC_FORWARD_S})")
+    elif act.back:
+        # no move_back helper — small look turn instead of walking into danger
+        parts.append("back(ignored)")
+
+    # strafe via brief look+forward not implemented; record only
+    if act.left:
+        parts.append("left")
+    if act.right:
+        parts.append("right")
+
+    slot = hud.selected_slot if hud is not None and getattr(hud, "ok", False) else 0
+    hold_s = bc.hold_s_for_slot(slot if slot is not None and slot >= 0 else 0)
+    # clamp insane p90 from accidental long holds in data
+    hold_s = float(min(max(hold_s, 0.2), 3.0))
+
+    if act.mine:
+        safe_chop(hold_s)
+        parts.append(f"mine({hold_s:.2f}s)")
+        ctx.chop_attempts += 1
+
+    # success heuristic: were mining and tree vanished
+    if tree is None and ctx.chop_attempts >= 2:
+        ctx.chops_done += 1
+        ctx.chop_attempts = 0
+        parts.append(f"chop_ok? done={ctx.chops_done}/{ctx.max_chops}")
+        if ctx.chops_done >= ctx.max_chops:
+            transition(ctx, State.DONE, "bc chop count")
+    elif tree is not None:
+        # reset streak if tree still there after long mine
+        if not act.mine:
+            pass
+
+    if not parts:
+        # idle — slow scan so we don't freeze
+        if tree is None:
+            safe_look(SEARCH_LOOK_DX, 0)
+            parts.append(f"idle_scan(+{SEARCH_LOOK_DX})")
+        else:
+            parts.append("idle")
+
+    # probs for debug
+    if act.probs:
+        top = sorted(act.probs.items(), key=lambda kv: -kv[1])[:4]
+        pr = " ".join(f"{k[:4]}={v:.2f}" for k, v in top)
+        parts.append(f"p[{pr}]")
+
+    return "action=bc " + " ".join(parts)
+
+
 def tick_once(
     ctx: AgentContext,
     model: YOLO,
     region: dict,
     conf: float,
+    bc=None,
 ) -> None:
     ctx.tick += 1
     frame = capture_frame(region)
@@ -302,15 +377,25 @@ def tick_once(
     tree = pick_best_tree(dets, w)
 
     # Optional HUD (non-fatal if it fails — menus, darkness, etc.)
+    hud = None
     hud_str = ""
     try:
         hud = parse_hud(frame, return_crops=False)
         if hud.ok:
-            hud_str = f" HP={hud.health}/20 Food={hud.hunger}/20"
+            hud_str = f" HP={hud.health}/20 Food={hud.hunger}/20 slot={hud.selected_slot}"
     except Exception:
         pass
 
-    if ctx.state is State.SEARCHING:
+    if bc is not None and ctx.state is not State.DONE:
+        action = step_bc(ctx, tree, hud, w, h, bc)
+        # keep a coarse state label for logs
+        if tree is None:
+            ctx.state = State.SEARCHING
+        elif tree.height_frac(h) >= CLOSE_ENOUGH_FRAC:
+            ctx.state = State.CHOPPING
+        else:
+            ctx.state = State.APPROACHING
+    elif ctx.state is State.SEARCHING:
         action = step_searching(ctx, tree)
     elif ctx.state is State.APPROACHING:
         action = step_approaching(ctx, tree, w, h)
@@ -337,11 +422,17 @@ def tick_once(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Minecraft tree-chop agent")
-    p.add_argument("--model", type=Path, default=MODEL_PATH, help="path to best.pt")
+    p.add_argument("--model", type=Path, default=MODEL_PATH, help="path to YOLO best.pt")
     p.add_argument("--conf", type=float, default=CONF_THRESHOLD, help="YOLO confidence")
     p.add_argument("--chops", type=int, default=DEFAULT_MAX_CHOPS, help="successful chops then exit")
     p.add_argument("--fps", type=float, default=TARGET_FPS, help="decision rate cap")
     p.add_argument("--countdown", type=float, default=STARTUP_COUNTDOWN_S)
+    p.add_argument(
+        "--bc",
+        action="store_true",
+        help="use behavioral-cloning policy (policy/bc_mlp.pt) instead of pure state machine",
+    )
+    p.add_argument("--policy", type=Path, default=POLICY_PATH, help="BC weights path")
     return p.parse_args(argv)
 
 
@@ -352,6 +443,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     enable_dpi_awareness()
     model = load_model(args.model)
 
+    bc = None
+    if args.bc:
+        from policy import BCAgent
+        bc = BCAgent(weights=args.policy)
+        print(f"[init] BC policy loaded from {args.policy}")
+        print(f"[init] hold_table={bc.hold_table}")
+
     print(f"Click into the Minecraft game world now — {args.countdown:.0f}s")
     time.sleep(args.countdown)
 
@@ -360,11 +458,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[init] Capture region: {region}")
     print(
         f"[init] conf={args.conf} cv_fallback={USE_CV_FALLBACK} "
-        f"close_frac={CLOSE_ENOUGH_FRAC} fps={args.fps} max_chops={args.chops}"
+        f"close_frac={CLOSE_ENOUGH_FRAC} fps={args.fps} max_chops={args.chops} "
+        f"mode={'BC' if bc else 'FSM'}"
     )
     print("[init] Goal: SEARCH -> APPROACH -> CHOP tree. Ctrl+C to stop.")
 
     ctx = AgentContext(max_chops=max(1, args.chops))
+
+    # apply learned default hold into FSM chop path too
+    global CHOP_HOLD_S
+    if bc is not None:
+        CHOP_HOLD_S = float(min(max(bc.hold_table.get("default_hold_s", CHOP_HOLD_S), 0.2), 3.0))
 
     try:
         while ctx.state is not State.DONE:
@@ -379,7 +483,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     except Exception as e:
                         print(f"[warn] window refresh failed: {e}")
 
-                tick_once(ctx, model, region, args.conf)
+                tick_once(ctx, model, region, args.conf, bc=bc)
             except Exception as e:
                 # Per-tick errors shouldn't leave keys stuck; log and continue
                 release_controls()

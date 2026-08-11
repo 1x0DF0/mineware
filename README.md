@@ -53,6 +53,18 @@ py .\mine_stats.py --session sessions\<id>
 Each session writes `sessions/<timestamp>/meta.jsonl` (+ optional `frames/`).
 Every tick logs HUD, tree detections, keys, mouse deltas, and LMB hold duration.
 
+### Train + run behavioral cloning
+
+```powershell
+# after one or more record_session runs:
+py .\train_policy.py
+
+# agent driven by learned policy (mine / forward / look)
+py .\agent.py --bc --chops 1
+```
+
+Writes `policy/bc_mlp.pt` + `policy/bc_meta.json` (includes mine hold table).
+
 If weights are missing:
 
 ```powershell

@@ -1,0 +1,101 @@
+{
+  "action_names": [
+    "forward",
+    "back",
+    "left",
+    "right",
+    "jump",
+    "sprint",
+    "mine",
+    "look_left",
+    "look_right"
+  ],
+  "feature_dim": 16,
+  "hidden": 64,
+  "thresholds": {
+    "forward": 0.5,
+    "back": 0.5,
+    "left": 0.35,
+    "right": 0.5,
+    "jump": 0.35,
+    "sprint": 0.5,
+    "mine": 0.5,
+    "look_left": 0.5,
+    "look_right": 0.5
+  },
+  "hold_table": {
+    "default_hold_s": 0.25,
+    "by_slot_s": {
+      "-1": 0.25,
+      "0": 0.25,
+      "2": 0.25,
+      "5": 1.71
+    },
+    "n_holds": 7,
+    "max_hold_ms_filter": 4000
+  },
+  "val_metrics": {
+    "forward": {
+      "f1": 0.4230769230769231,
+      "prec": 0.275,
+      "rec": 0.9166666666666666,
+      "rate": 0.10169491171836853
+    },
+    "back": {
+      "f1": 0.0,
+      "prec": 0.0,
+      "rec": 0.0,
+      "rate": 0.0
+    },
+    "left": {
+      "f1": 0.0,
+      "prec": 0.0,
+      "rec": 0.0,
+      "rate": 0.016949152573943138
+    },
+    "right": {
+      "f1": 0.30769230769230765,
+      "prec": 0.2,
+      "rec": 0.6666666666666666,
+      "rate": 0.025423727929592133
+    },
+    "jump": {
+      "f1": 0.0,
+      "prec": 0.0,
+      "rec": 0.0,
+      "rate": 0.008474576286971569
+    },
+    "sprint": {
+      "f1": 0.45454545454545453,
+      "prec": 0.29411764705882354,
+      "rec": 1.0,
+      "rate": 0.04237288236618042
+    },
+    "mine": {
+      "f1": 0.8819875776397516,
+      "prec": 0.8987341772151899,
+      "rec": 0.8658536585365854,
+      "rate": 0.694915235042572
+    },
+    "look_left": {
+      "f1": 0.2222222222222222,
+      "prec": 0.13333333333333333,
+      "rec": 0.6666666666666666,
+      "rate": 0.025423727929592133
+    },
+    "look_right": {
+      "f1": 0.16666666666666669,
+      "prec": 0.1,
+      "rec": 0.5,
+      "rate": 0.016949152573943138
+    },
+    "hamming_acc": 0.908662900188324
+  },
+  "sessions": [
+    "/mnt/c/Users/leoga/Desktop/mineware/sessions/20260810_174149",
+    "/mnt/c/Users/leoga/Desktop/mineware/sessions/20260810_174618"
+  ],
+  "n_train": 475,
+  "n_val": 118,
+  "best_mean_f1": 0.3070238939804157
+}
