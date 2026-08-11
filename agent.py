@@ -5,9 +5,9 @@ Reuses capture/input from main.py, HUD parsing from hud.py, and the trained
 YOLOv8 weights at minecraft_yolo/run1/weights/best.pt.
 
 Usage (Windows Python, Minecraft in-world with cursor locked):
-    py .\agent.py
-    py .\agent.py --chops 3
-    py .\agent.py --model minecraft_yolo/run1/weights/best.pt --conf 0.4
+    py agent.py
+    py agent.py --chops 3
+    py agent.py --conf 0.2
 
 Ctrl+C exits cleanly and releases held keys/mouse.
 """
@@ -29,6 +29,7 @@ from ultralytics import YOLO
 
 from main import (
     capture_frame,
+    enable_dpi_awareness,
     focus_minecraft,
     get_region,
     look,
@@ -36,6 +37,12 @@ from main import (
     move_forward,
 )
 from hud import parse_hud
+from trees import (
+    Detection,
+    detect_trees,
+    format_dets,
+    pick_best_tree,
+)
 
 pydirectinput.FAILSAFE = False
 
@@ -46,10 +53,9 @@ pydirectinput.FAILSAFE = False
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "minecraft_yolo" / "run1" / "weights" / "best.pt"
 
-# Perception
-CONF_THRESHOLD = 0.35          # min YOLO conf to trust a tree box
-# Class name substrings that count as a choppable tree (case-insensitive)
-TREE_CLASS_HINTS = ("tree", "log", "wood", "oak", "birch", "spruce", "jungle", "acacia", "dark_oak")
+# Perception — low YOLO conf; CV fallback fills in when model is silent
+CONF_THRESHOLD = 0.20
+USE_CV_FALLBACK = True
 
 # Approach / distance (bbox height / frame height)
 CLOSE_ENOUGH_FRAC = 0.42       # box taller than this → CHOPPING
@@ -86,39 +92,6 @@ class State(Enum):
     DONE = auto()
 
 
-@dataclass
-class Detection:
-    cls_name: str
-    conf: float
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-
-    @property
-    def cx(self) -> float:
-        return 0.5 * (self.x1 + self.x2)
-
-    @property
-    def cy(self) -> float:
-        return 0.5 * (self.y1 + self.y2)
-
-    @property
-    def width(self) -> float:
-        return max(0.0, self.x2 - self.x1)
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.y2 - self.y1)
-
-    @property
-    def area(self) -> float:
-        return self.width * self.height
-
-    def height_frac(self, frame_h: int) -> float:
-        return self.height / max(frame_h, 1)
-
-
 # =====================================================================
 # Perception helpers
 # =====================================================================
@@ -136,58 +109,6 @@ def load_model(path: Path) -> YOLO:
     }
     print(f"[init] Classes: {names}")
     return model
-
-
-def is_tree_class(name: str) -> bool:
-    n = name.lower().replace(" ", "_")
-    return any(h in n for h in TREE_CLASS_HINTS)
-
-
-def detect_all(model: YOLO, frame: np.ndarray, conf: float) -> List[Detection]:
-    """Run one forward pass; return all boxes above conf."""
-    results = model.predict(frame, conf=conf, verbose=False)
-    out: List[Detection] = []
-    if not results:
-        return out
-    r0 = results[0]
-    if r0.boxes is None or len(r0.boxes) == 0:
-        return out
-    names = model.names
-    for box in r0.boxes:
-        cls_id = int(box.cls[0])
-        cls_name = names[cls_id] if isinstance(names, dict) else names[cls_id]
-        xyxy = box.xyxy[0].tolist()
-        out.append(
-            Detection(
-                cls_name=str(cls_name),
-                conf=float(box.conf[0]),
-                x1=float(xyxy[0]),
-                y1=float(xyxy[1]),
-                x2=float(xyxy[2]),
-                y2=float(xyxy[3]),
-            )
-        )
-    return out
-
-
-def pick_best_tree(dets: List[Detection], frame_w: int) -> Optional[Detection]:
-    """Prefer the highest-conf tree; break ties by proximity to frame center."""
-    trees = [d for d in dets if is_tree_class(d.cls_name)]
-    if not trees:
-        return None
-    cx = frame_w * 0.5
-
-    def score(d: Detection) -> Tuple[float, float]:
-        # higher conf first; then closer to center
-        return (d.conf, -abs(d.cx - cx))
-
-    return max(trees, key=score)
-
-
-def format_dets(dets: List[Detection]) -> str:
-    if not dets:
-        return "(none)"
-    return ", ".join(f"{d.cls_name}:{d.conf:.2f}" for d in dets)
 
 
 # =====================================================================
@@ -372,7 +293,12 @@ def tick_once(
     ctx.tick += 1
     frame = capture_frame(region)
     h, w = frame.shape[:2]
-    dets = detect_all(model, frame, conf)
+    # Black / frozen capture → useless
+    if frame.mean() < 5:
+        print(f"[{ctx.tick:04d}] WARN capture nearly black mean={frame.mean():.1f} region={region}")
+    dets = detect_trees(
+        frame, model=model, conf=conf, use_cv_fallback=USE_CV_FALLBACK
+    )
     tree = pick_best_tree(dets, w)
 
     # Optional HUD (non-fatal if it fails — menus, darkness, etc.)
@@ -423,17 +349,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     period = 1.0 / max(args.fps, 0.5)
 
+    enable_dpi_awareness()
     model = load_model(args.model)
 
     print(f"Click into the Minecraft game world now — {args.countdown:.0f}s")
     time.sleep(args.countdown)
 
     win = focus_minecraft()
-    region = get_region(win)
+    region = get_region(win, client_only=True)
     print(f"[init] Capture region: {region}")
     print(
-        f"[init] conf={args.conf} close_frac={CLOSE_ENOUGH_FRAC} "
-        f"fps={args.fps} max_chops={args.chops}"
+        f"[init] conf={args.conf} cv_fallback={USE_CV_FALLBACK} "
+        f"close_frac={CLOSE_ENOUGH_FRAC} fps={args.fps} max_chops={args.chops}"
     )
     print("[init] Goal: SEARCH -> APPROACH -> CHOP tree. Ctrl+C to stop.")
 
@@ -443,11 +370,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         while ctx.state is not State.DONE:
             t0 = time.perf_counter()
             try:
-                # Refresh window region occasionally in case of resize/move
+                # Refresh region only (no re-activate — that steals focus mid-game)
                 if ctx.tick % 30 == 0 and ctx.tick > 0:
                     try:
-                        win = focus_minecraft()
-                        region = get_region(win)
+                        wins = __import__("pygetwindow").getWindowsWithTitle("Minecraft")
+                        if wins:
+                            region = get_region(wins[0], client_only=True)
                     except Exception as e:
                         print(f"[warn] window refresh failed: {e}")
 
